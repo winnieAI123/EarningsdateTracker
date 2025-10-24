@@ -1,0 +1,5 @@
+{
+  "name": "业绩会议追踪器",
+  "description": "一个使用 Gemini API 追踪特定公司（如特斯拉、苹果、英伟达等）即将举行的业绩会议日期的网站。",
+  "requestFramePermissions": []
+}
