@@ -466,6 +466,7 @@ class SubstackCollector:
     def _fetch_via_html_parsing(self, html: str) -> Optional[Dict]:
         """
         传统 HTML 解析方法（备用）
+        针对 Substack 文章页面结构优化
         """
         if not BS4_AVAILABLE:
             return None
@@ -499,44 +500,88 @@ class SubstackCollector:
                 if author:
                     break
 
-            # 提取正文 - 更新选择器
+            # 提取正文 - 优化选择器顺序
+            # 基于实际 Substack 页面结构: article 内的内容区域
             content = ""
-            body_selectors = [
-                'div.body.markup',
-                'div.post-content',
-                'article.post',
-                'div[class*="body"]',
-                '.available-content',
-                'div.post',
-            ]
-            for selector in body_selectors:
-                body_elem = soup.select_one(selector)
-                if body_elem:
-                    # 移除不需要的元素
-                    for unwanted in body_elem.select('script, style, nav, footer, .subscription-widget'):
-                        unwanted.decompose()
-                    content = body_elem.get_text(separator='\n', strip=True)
-                    if len(content) > 100:  # 确保有足够内容
-                        break
+
+            # 策略1: 直接查找 article 标签内的所有段落
+            article = soup.find('article')
+            if article:
+                # 移除不需要的元素
+                for unwanted in article.select('script, style, nav, footer, .subscription-widget, .subscribe-widget, .paywall'):
+                    unwanted.decompose()
+
+                # 收集所有文本内容 (p, h1-h6, li, blockquote 等)
+                content_parts = []
+                for elem in article.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre', 'code']):
+                    text = elem.get_text(strip=True)
+                    if text and len(text) > 1:  # 过滤空白
+                        content_parts.append(text)
+
+                if content_parts:
+                    content = '\n\n'.join(content_parts)
+
+            # 策略2: 备用选择器
+            if not content or len(content) < 200:
+                body_selectors = [
+                    'div.body.markup',
+                    'div.post-content',
+                    'div.available-content',
+                    'div[class*="body"] div[class*="markup"]',
+                    '.post-content-container',
+                ]
+                for selector in body_selectors:
+                    body_elem = soup.select_one(selector)
+                    if body_elem:
+                        for unwanted in body_elem.select('script, style, nav, footer, .subscription-widget'):
+                            unwanted.decompose()
+
+                        # 同样收集段落
+                        content_parts = []
+                        for elem in body_elem.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']):
+                            text = elem.get_text(strip=True)
+                            if text and len(text) > 1:
+                                content_parts.append(text)
+
+                        if content_parts:
+                            new_content = '\n\n'.join(content_parts)
+                            if len(new_content) > len(content):
+                                content = new_content
+
+                        if len(content) > 500:
+                            break
 
             if content:
                 self.logger.info(f"  [HTML] 成功获取: {len(content)} 字符")
                 return {'author': author, 'content': content}
 
         except Exception as e:
-            pass
+            self.logger.warning(f"  [HTML] 解析错误: {e}")
 
         return None
 
-    def fetch_post_content(self, url: str) -> Optional[Dict]:
+    def fetch_post_content(self, url: str, min_content_threshold: int = 500) -> Optional[Dict]:
         """
-        获取文章内容 - 多策略尝试
-        优先级: API > 嵌入JSON > HTML解析
+        获取文章内容 - 多策略尝试，返回最完整的内容
+        策略: API, 嵌入JSON, HTML解析 - 比较结果取最长
+
+        Args:
+            url: 文章 URL
+            min_content_threshold: 最小内容阈值，低于此值会继续尝试其他策略
         """
-        # 策略1: 尝试 API (最可靠，不需要 JS 渲染)
-        result = self._fetch_via_api(url)
-        if result and result.get('content'):
-            return result
+        best_result = {'author': '', 'content': ''}
+        best_content_len = 0
+
+        # 策略1: 尝试 API
+        api_result = self._fetch_via_api(url)
+        if api_result and api_result.get('content'):
+            content_len = len(api_result['content'])
+            if content_len > best_content_len:
+                best_result = api_result
+                best_content_len = content_len
+            # 如果 API 返回足够长的内容，直接返回
+            if content_len >= min_content_threshold:
+                return best_result
 
         # 策略2 & 3: 需要先获取 HTML
         client = self.scraper if self.scraper else self.session
@@ -551,14 +596,26 @@ class SubstackCollector:
                 html = response.text
 
                 # 策略2: 从嵌入的 JSON 提取
-                result = self._fetch_via_embedded_json(html, url)
-                if result and result.get('content'):
-                    return result
+                json_result = self._fetch_via_embedded_json(html, url)
+                if json_result and json_result.get('content'):
+                    content_len = len(json_result['content'])
+                    if content_len > best_content_len:
+                        best_result = json_result
+                        best_content_len = content_len
+                    if content_len >= min_content_threshold:
+                        return best_result
 
-                # 策略3: 传统 HTML 解析
-                result = self._fetch_via_html_parsing(html)
-                if result and result.get('content'):
-                    return result
+                # 策略3: 传统 HTML 解析 (通常能获取最完整的内容)
+                html_result = self._fetch_via_html_parsing(html)
+                if html_result and html_result.get('content'):
+                    content_len = len(html_result['content'])
+                    if content_len > best_content_len:
+                        best_result = html_result
+                        best_content_len = content_len
+
+                # 返回最佳结果
+                if best_content_len > 0:
+                    return best_result
 
                 # 如果都失败了，可能是付费内容
                 self.logger.warning(f"  无法提取内容（可能是付费文章）: {url}")
@@ -581,6 +638,9 @@ class SubstackCollector:
                 else:
                     self.logger.warning(f"  [{client_name}] 获取失败: {e}")
 
+        # 如果所有尝试都失败，返回之前可能获取到的最佳结果
+        if best_content_len > 0:
+            return best_result
         return None
 
     def fetch_all_posts_content(self, posts: List[Dict], min_content_length: int = 200) -> List[Dict]:
